@@ -17,8 +17,28 @@ from utils.write_excel import write_cost_neutral_hedge_results
 #     {"product_type": "day", "load_type": "base"},
 #     {"product_type": "day", "load_type": "peak"},
 #     {"product_type": "weekend", "load_type": "base"},
-# ] # day, weekend
-SUBSET_FILTER = {"product_type": ["month"], "load_type": ["base", "peak"]} # month base and peak
+# ]
+
+# Use this SUBSET_FILTER to run the optimization for year base and year peak products only
+# SUBSET_FILTER = [
+SUBSET_FILTER = [     
+    {"product_type": "year", "load_type": "base"},
+    {"product_type": "year", "load_type": "peak"},
+]
+
+# Use this SUBSET_FILTER to run the optimization for quarter base and year peak products only
+# SUBSET_FILTER = [
+#     {"product_type": "quarter", "load_type": "base"},
+#     {"product_type": "quarter", "load_type": "peak"},
+# ]
+
+# Use this SUBSET_FILTER to run the optimization for month base and year peak products only
+# SUBSET_FILTER = [
+#     {"product_type": "month", "load_type": "base"},
+#     {"product_type": "month", "load_type": "peak"},
+# ]
+
+
 
 # Flag to save the filtered subset coverage and metadata for reference/debugging
 SAVE_FILTERED_SUBSET = True
@@ -31,8 +51,8 @@ MIN_HEDGE_RATIO = True    # Constraint V
 # Model parameters
 EPSILON = 0.3            # Tolerance band for constraint III
 HEDGE_RATIO_LB = 0.0     # Lower bound for a^j (IV)
-HEDGE_RATIO_UB = 2.0      # Upper bound for a^j (IV)
-H_MIN = 0.8               # Minimum hedge ratio (V)
+HEDGE_RATIO_UB = 1    # Upper bound for a^j (IV)
+H_MIN = 0.95               # Minimum hedge ratio (V)
 
 # Data paths
 COVERAGE_PATH = "utils/data/hedge_instruments_coverage.parquet"
@@ -98,8 +118,7 @@ def main():
     # Filter subset and get coverage/metadata
     try:
         filtered_coverage, run_dir = filter_hedge_instruments(
-            product_type=SUBSET_FILTER["product_type"],
-            load_type=SUBSET_FILTER["load_type"],
+            subset_filter=SUBSET_FILTER,
             coverage_path=COVERAGE_PATH,
             mapping_path=METADATA_PATH,
             save=SAVE_FILTERED_SUBSET
@@ -110,16 +129,26 @@ def main():
         metadata = pd.read_parquet(METADATA_PATH)
     except Exception as e:
         raise RuntimeError(f"Failed to read metadata parquet file {METADATA_PATH}: {e}")
-    # Support both single values and lists for product_type/load_type
-    if isinstance(SUBSET_FILTER["product_type"], (list, tuple, set)):
-        product_type_filter = metadata["product_type"].isin(SUBSET_FILTER["product_type"])
+    # Support SUBSET_FILTER as a list of dicts for precise selection
+    if isinstance(SUBSET_FILTER, list):
+        mask = pd.Series([False] * len(metadata))
+        for filt in SUBSET_FILTER:
+            pt = filt["product_type"]
+            lt = filt["load_type"]
+            pt_mask = metadata["product_type"] == pt
+            lt_mask = metadata["load_type"] == lt
+            mask = mask | (pt_mask & lt_mask)
+        subset_ids = metadata[mask]["instrument_id"].tolist()
     else:
-        product_type_filter = metadata["product_type"] == SUBSET_FILTER["product_type"]
-    if isinstance(SUBSET_FILTER["load_type"], (list, tuple, set)):
-        load_type_filter = metadata["load_type"].isin(SUBSET_FILTER["load_type"])
-    else:
-        load_type_filter = metadata["load_type"] == SUBSET_FILTER["load_type"]
-    subset_ids = metadata[product_type_filter & load_type_filter]["instrument_id"].tolist()
+        if isinstance(SUBSET_FILTER["product_type"], (list, tuple, set)):
+            product_type_filter = metadata["product_type"].isin(SUBSET_FILTER["product_type"])
+        else:
+            product_type_filter = metadata["product_type"] == SUBSET_FILTER["product_type"]
+        if isinstance(SUBSET_FILTER["load_type"], (list, tuple, set)):
+            load_type_filter = metadata["load_type"].isin(SUBSET_FILTER["load_type"])
+        else:
+            load_type_filter = metadata["load_type"] == SUBSET_FILTER["load_type"]
+        subset_ids = metadata[product_type_filter & load_type_filter]["instrument_id"].tolist()
 
     # Calculate forward prices for the subset (updates metadata)
     try:
@@ -269,6 +298,9 @@ def main():
                     minval = np.min(val) if hasattr(val, '__len__') else val
                     print(f"Constraint {i} (inequality): min value = {minval}")
 
+            import time
+            print("Starting optimizer...")
+            t0 = time.time()
             # Run the optimization using SLSQP with all constraints and bounds
             result = minimize(
                 objective,           # Objective function to minimize
@@ -278,6 +310,8 @@ def main():
                 constraints=constraints,  # List of constraints (dicts)
                 options={'disp': True}    # Display solver output
             )
+            t1 = time.time()
+            print(f"Optimizer finished. Elapsed: {t1-t0:.2f} seconds.")
             # Print the optimal hedge ratios found by the optimizer
             print("\nOptimal hedge ratios:", result.x)
             print("Success:", result.success)
@@ -295,6 +329,8 @@ def main():
                 print("Full optimization result:")
                 print(result)
 
+            print("Preparing to write results to Excel...")
+            t2 = time.time()
             # --- WRITE RESULTS TO EXCEL IN CURRENT RUN FOLDER ---
             # Prepare result dict for writing
             # Also collect constraint values at solution for Excel output
@@ -321,7 +357,6 @@ def main():
             hour_index = coverage.index if hasattr(coverage, "index") else None
             # Compute hedge profile using the local function
             hedge_profile = hedge_profile_latex(result.x)
-            # Write to Excel in a timestamped run folder
             output_path = write_cost_neutral_hedge_results(
                 result=result_dict,
                 instrument_names=instrument_names,
@@ -332,7 +367,9 @@ def main():
                 forward_prices=forward_prices,
                 output_dir=run_dir if run_dir is not None else None,  # Use run_dir if available
             )
+            t3 = time.time()
             print(f"Results written to: {output_path}")
+            print(f"Excel writing elapsed: {t3-t2:.2f} seconds.")
         except Exception as e:
             print(f"Optimization failed: {e}")
             import traceback

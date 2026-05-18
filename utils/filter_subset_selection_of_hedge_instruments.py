@@ -57,7 +57,7 @@ def load_coverage_and_metadata(coverage_path, mapping_path=None):
 	except Exception as e:
 		raise RuntimeError(f"Failed to load coverage or metadata: {e}")
 
-def filter_hedge_instruments(product_type, load_type, coverage_path='hedge_instruments_coverage.parquet', mapping_path=None, save=True, run_dir=None):
+def filter_hedge_instruments(subset_filter, coverage_path='hedge_instruments_coverage.parquet', mapping_path=None, save=True, run_dir=None):
 	"""
 	Filter hedge instruments by product_type and load_type, and save the filtered results.
 	Steps:
@@ -88,38 +88,45 @@ def filter_hedge_instruments(product_type, load_type, coverage_path='hedge_instr
 	"""
 	try:
 		coverage_df, metadata_df = load_coverage_and_metadata(coverage_path, mapping_path)
-		# Filter metadata for the selected product_type and load_type
-		# Support both single values and lists for product_type/load_type
-		if isinstance(product_type, (list, tuple, set)):
-			product_type_filter = metadata_df['product_type'].isin(product_type)
+		# Support both a list of dicts (precise selection) or a dict (legacy)
+		if isinstance(subset_filter, list):
+			mask = pd.Series([False] * len(metadata_df))
+			for filt in subset_filter:
+				pt = filt["product_type"]
+				lt = filt["load_type"]
+				pt_mask = metadata_df["product_type"] == pt
+				lt_mask = metadata_df["load_type"] == lt
+				mask = mask | (pt_mask & lt_mask)
+			filtered_meta = metadata_df[mask]
+			suffix = "_and".join([f"{filt['product_type']}_{filt['load_type']}" for filt in subset_filter])
 		else:
-			product_type_filter = metadata_df['product_type'] == product_type
-		if isinstance(load_type, (list, tuple, set)):
-			load_type_filter = metadata_df['load_type'].isin(load_type)
-		else:
-			load_type_filter = metadata_df['load_type'] == load_type
-		filtered_meta = metadata_df[product_type_filter & load_type_filter]
+			if isinstance(subset_filter["product_type"], (list, tuple, set)):
+				product_type_filter = metadata_df["product_type"].isin(subset_filter["product_type"])
+			else:
+				product_type_filter = metadata_df["product_type"] == subset_filter["product_type"]
+			if isinstance(subset_filter["load_type"], (list, tuple, set)):
+				load_type_filter = metadata_df["load_type"].isin(subset_filter["load_type"])
+			else:
+				load_type_filter = metadata_df["load_type"] == subset_filter["load_type"]
+			filtered_meta = metadata_df[product_type_filter & load_type_filter]
+			suffix = f"{subset_filter['product_type']}_{subset_filter['load_type']}"
 		selected_ids = filtered_meta['instrument_id'].tolist()
 		if not selected_ids:
-			print(f"No instruments found for product_type='{product_type}' and load_type='{load_type}'.")
+			print(f"No instruments found for subset_filter={subset_filter}.")
 			return None, None
-		# Always include the datetime column if present in coverage
 		cols = ['datetime'] + selected_ids if 'datetime' in coverage_df.columns else selected_ids
 		filtered_coverage = coverage_df[cols]
 		print(f"Filtered coverage matrix shape: {filtered_coverage.shape}")
 		actual_run_dir = None
 		if save:
-			# Create run directory if not provided
 			if run_dir is None:
 				timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 				run_dir = os.path.join('Data', 'runs', f'run_{timestamp}')
 			os.makedirs(run_dir, exist_ok=True)
 			actual_run_dir = run_dir
-			# Build output file paths for this run
-			out_coverage_parquet = os.path.join(run_dir, f'filtered_coverage_{product_type}_{load_type}.parquet')
-			out_metadata_parquet = os.path.join(run_dir, f'filtered_metadata_{product_type}_{load_type}.parquet')
-			out_excel = os.path.join(run_dir, f'filtered_coverage_and_metadata_{product_type}_{load_type}.xlsx')
-			# Save filtered coverage and metadata
+			out_coverage_parquet = os.path.join(run_dir, f'filtered_coverage_{suffix}.parquet')
+			out_metadata_parquet = os.path.join(run_dir, f'filtered_metadata_{suffix}.parquet')
+			out_excel = os.path.join(run_dir, f'filtered_coverage_and_metadata_{suffix}.xlsx')
 			filtered_coverage.to_parquet(out_coverage_parquet)
 			filtered_meta.to_parquet(out_metadata_parquet)
 			print(f"Filtered coverage saved to {out_coverage_parquet}")
@@ -136,7 +143,6 @@ def filter_hedge_instruments(product_type, load_type, coverage_path='hedge_instr
 
 			# Reload the updated metadata (with prices) for Excel export
 			updated_meta = pd.read_parquet(out_metadata_parquet)
-			# Save as Excel with metadata sheet (now including price column)
 			with pd.ExcelWriter(out_excel, engine='openpyxl') as writer:
 				filtered_coverage.to_excel(writer, sheet_name='coverage', index=True)
 				updated_meta.to_excel(writer, sheet_name='metadata', index=False)

@@ -56,8 +56,7 @@ def test_all_combinations_valid(tmp_path):
     combinations = get_all_combinations(metadata)
     for product_type, load_type in combinations:
         df = filter_hedge_instruments(
-            product_type=product_type,
-            load_type=load_type,
+            subset_filter={"product_type": product_type, "load_type": load_type},
             coverage_path=coverage_path,
             mapping_path=metadata_path,
             save=False
@@ -72,8 +71,7 @@ def test_filter_month_base(tmp_path):
     """
     coverage_path, metadata_path = make_test_data(tmp_path)
     df, _ = filter_hedge_instruments(
-        product_type='month',
-        load_type='base',
+        subset_filter={"product_type": 'month', "load_type": 'base'},
         coverage_path=coverage_path,
         mapping_path=metadata_path,
         save=False
@@ -92,8 +90,7 @@ def test_filter_year_peak(tmp_path):
     """
     coverage_path, metadata_path = make_test_data(tmp_path)
     df, _ = filter_hedge_instruments(
-        product_type='year',
-        load_type='peak',
+        subset_filter={"product_type": 'year', "load_type": 'peak'},
         coverage_path=coverage_path,
         mapping_path=metadata_path,
         save=False
@@ -110,8 +107,7 @@ def test_filter_none(tmp_path):
     """
     coverage_path, metadata_path = make_test_data(tmp_path)
     df = filter_hedge_instruments(
-        product_type='week',
-        load_type='base',
+        subset_filter={"product_type": 'week', "load_type": 'base'},
         coverage_path=coverage_path,
         mapping_path=metadata_path,
         save=False

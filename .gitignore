@@ -28,3 +28,18 @@ Thumbs.db
 # Project specific
 *.csv
 .ipynb_checkpoints/
+
+# Ignore all run outputs
+Data/runs/
+Data/runs_to_do/
+
+# Ignore LaTeX build files in formulas/
+formulas/*.aux
+formulas/*.bbl
+formulas/*.blg
+formulas/*.fdb_latexmk
+formulas/*.fls
+formulas/*.toc
+formulas/*.log
+formulas/*.out
+formulas/*.synctex.gz
