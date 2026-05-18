@@ -9,3 +9,7 @@
 *.bbl
 *.blg
 *.pdf
+*.tex
+*.html
+*.txt
+*.md
