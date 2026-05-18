@@ -87,11 +87,16 @@ def write_cost_neutral_hedge_results(
 
     # Format model flags/params as DataFrame for Excel output
     def try_float_round(x):
+        # Keep booleans as-is (e.g., for 'success')
+        if isinstance(x, bool):
+            return x
         try:
             return round(float(x), 3)
         except Exception:
             return x
-    summary_df["value"] = summary_df["value"].apply(try_float_round)
+    summary_df["value"] = summary_df.apply(
+        lambda row: row["value"] if row["metric"] == "success" else try_float_round(row["value"]), axis=1
+    )
 
     # Calculate hedge volumes per instrument (if coverage matrix is available)
     coverage = result.get('coverage', None)
@@ -177,7 +182,7 @@ def write_cost_neutral_hedge_results(
             for row in ws_summary.iter_rows(min_row=2, min_col=1, max_col=ws_summary.max_column, max_row=ws_summary.max_row):
                 cell = row[value_col-1]
                 if isinstance(cell.value, (int, float)):
-                    cell.number_format = '#.##0,000'
+                    cell.number_format = '#,##0.000'
 
     return filepath
 
