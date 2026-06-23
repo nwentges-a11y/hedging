@@ -43,3 +43,8 @@ formulas/*.toc
 formulas/*.log
 formulas/*.out
 formulas/*.synctex.gz
+
+# Ignore accidentally generated root-level formula artifacts
+formulas.pdf
+formulas.aux
+formulas.log
