@@ -14,9 +14,10 @@ def make_test_files(tmp_path):
     Create small test files for coverage, metadata, and price data.
     Returns file paths for use in tests.
     """
-    # Create a small coverage DataFrame (2 instruments, 4 hours)
+    # Create a small coverage DataFrame (2 instruments, 4 hours) with timezone-aware datetime
+    # Must match timezone of price data for index alignment
     coverage = pd.DataFrame({
-        'datetime': pd.date_range('2024-01-01', periods=4, freq='h'),
+        'datetime': pd.date_range('2024-01-01', periods=4, freq='h', tz='Europe/Berlin'),
         'A': [1, 0, 1, 0],
         'B': [0, 1, 0, 1]
     })
@@ -25,9 +26,9 @@ def make_test_files(tmp_path):
         'instrument_id': ['A', 'B'],
         'price': [np.nan, np.nan]
     })
-    # Create a small price DataFrame
+    # Create a small price DataFrame with timezone-aware datetimes
     price = pd.DataFrame({
-        'datetime': pd.date_range('2024-01-01', periods=4, freq='h'),
+        'datetime': pd.date_range('2024-01-01', periods=4, freq='h', tz='Europe/Berlin'),
         'price close': [10, 20, 30, 40]
     })
     # Write to files
@@ -37,7 +38,7 @@ def make_test_files(tmp_path):
     output_metadata_path = tmp_path / 'metadata_out.parquet'
     coverage.to_parquet(coverage_path)
     metadata.to_parquet(metadata_path)
-    price.to_csv(price_path, sep=';', index=False, decimal=',', date_format='%d.%m.%Y %H:%M')
+    price.to_csv(price_path, sep=';', index=False, decimal=',')
     return str(coverage_path), str(metadata_path), str(price_path), str(output_metadata_path)
 
 def test_forward_price_basic(tmp_path):
@@ -95,3 +96,46 @@ def test_forward_price_missing_instrument(tmp_path):
     )
     result = pd.read_parquet(output_metadata_path)
     assert np.isnan(result.loc[result['instrument_id']=='C', 'price'].iloc[0])
+
+
+def test_forward_price_timezone_and_horizon(tmp_path):
+    """Supports timezone-aware datetime CSVs and optional time-horizon filtering."""
+    coverage = pd.DataFrame({
+        'datetime': pd.to_datetime([
+            '2026-01-01 00:00:00+01:00',
+            '2026-01-01 01:00:00+01:00',
+            '2026-01-01 02:00:00+01:00',
+            '2026-01-01 03:00:00+01:00',
+        ]),
+        'A': [1, 1, 0, 0],
+    })
+    metadata = pd.DataFrame({'instrument_id': ['A'], 'price': [np.nan]})
+    price_csv = tmp_path / 'price_tz.csv'
+    price_csv.write_text(
+        "datetime;price close\n"
+        "2026-01-01 00:00:00+01:00;10,0\n"
+        "2026-01-01 01:00:00+01:00;20,0\n"
+        "2026-01-01 02:00:00+01:00;30,0\n"
+        "2026-01-01 03:00:00+01:00;40,0\n",
+        encoding='utf-8',
+    )
+
+    coverage_path = tmp_path / 'coverage.parquet'
+    metadata_path = tmp_path / 'metadata.parquet'
+    output_metadata_path = tmp_path / 'metadata_out.parquet'
+    coverage.to_parquet(coverage_path)
+    metadata.to_parquet(metadata_path)
+
+    calculate_forward_prices_for_coverage(
+        coverage_path=str(coverage_path),
+        metadata_path=str(metadata_path),
+        price_csv_path=str(price_csv),
+        output_metadata_path=str(output_metadata_path),
+        price_column='price close',
+        start_date='2026-01-01 01:00:00+01:00',
+        end_date='2026-01-01 02:00:00+01:00',
+    )
+
+    result = pd.read_parquet(output_metadata_path)
+    # After horizon filter, instrument A only covers 01:00 with price 20.0.
+    assert np.isclose(result.loc[result['instrument_id'] == 'A', 'price'].iloc[0], 20.0)

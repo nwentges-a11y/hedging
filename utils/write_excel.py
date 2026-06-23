@@ -104,7 +104,12 @@ def write_cost_neutral_hedge_results(
         import numpy as np
         hedge_volumes = [result["a"][j] * np.sum(coverage[:, j] * loads) for j in range(coverage.shape[1])]
         hours_covered = np.sum(coverage, axis=0)
-        hedge_volumes_mw = np.where(hours_covered > 0, hedge_volumes / hours_covered, 0.0)
+        hedge_volumes_mw = np.divide(
+            np.asarray(hedge_volumes, dtype=float),
+            np.asarray(hours_covered, dtype=float),
+            out=np.zeros_like(np.asarray(hedge_volumes, dtype=float)),
+            where=np.asarray(hours_covered, dtype=float) > 0,
+        )
     else:
         hedge_volumes = [None] * len(result["a"])
         hedge_volumes_mw = [None] * len(result["a"])
@@ -130,7 +135,12 @@ def write_cost_neutral_hedge_results(
         }
     )
     if hour_index is not None:
-        hourly_df.insert(0, "timestamp", pd.to_datetime(hour_index))
+        ts = pd.to_datetime(hour_index)
+        # Excel does not support timezone-aware datetimes.
+        if isinstance(ts, pd.DatetimeIndex) and ts.tz is not None:
+            # Convert from internal timezone (often UTC) to business-local clock first.
+            ts = ts.tz_convert("Europe/Berlin").tz_localize(None)
+        hourly_df.insert(0, "timestamp", ts)
 
     import openpyxl
     with pd.ExcelWriter(filepath, engine="openpyxl") as writer:

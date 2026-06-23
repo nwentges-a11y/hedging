@@ -18,46 +18,29 @@ import os
 from datetime import datetime
 # Import the forward price calculation utility
 from utils.calculate_forward_prices_as_mean_from_pfc import calculate_forward_prices_for_coverage
+from utils.load_data import find_latest_csv_with_substring
+
+# Keep Excel export code available, but disable it by default for large runs.
+SAVE_EXCEL = False
 
 def load_coverage_and_metadata(coverage_path, mapping_path=None):
 	"""
-	Load the coverage matrix and metadata for hedge instruments.
-	- If coverage_path is an Excel file, loads both 'coverage' and 'metadata' sheets.
-	- If coverage_path is a Parquet file, loads coverage and metadata from separate files.
-	Raises FileNotFoundError if metadata is missing.
+	Load the coverage matrix and metadata for hedge instruments from Parquet files.
 	Returns:
 		coverage_df (pd.DataFrame): The coverage matrix (datetime x instrument_id).
 		metadata_df (pd.DataFrame): The instrument metadata.
 	"""
-	"""
-	Loads the coverage matrix and metadata.
-	- If coverage_path is an Excel file, loads both 'coverage' and 'metadata' sheets.
-	- If coverage_path is a Parquet file, loads coverage and metadata from separate files.
-	Raises FileNotFoundError if metadata is missing.
-	Returns: (coverage_df, metadata_df)
-	"""
 	try:
-		if coverage_path.endswith('.xlsx'):
-			# Excel file: try to read both sheets
-			xls = pd.ExcelFile(coverage_path)
-			coverage_df = pd.read_excel(xls, sheet_name='coverage', index_col=0)
-			if 'metadata' in xls.sheet_names:
-				metadata_df = pd.read_excel(xls, sheet_name='metadata')
-			else:
-				raise FileNotFoundError("No 'metadata' sheet found in the Excel file.")
-			return coverage_df, metadata_df
+		coverage_df = pd.read_parquet(coverage_path)
+		if mapping_path and os.path.exists(mapping_path):
+			metadata_df = pd.read_parquet(mapping_path)
 		else:
-			# Parquet file: try to read separate metadata file
-			coverage_df = pd.read_parquet(coverage_path)
-			if mapping_path and os.path.exists(mapping_path):
-				metadata_df = pd.read_parquet(mapping_path)
-			else:
-				raise FileNotFoundError("No metadata file found. Please provide a metadata parquet or use an Excel file with a 'metadata' sheet.")
-			return coverage_df, metadata_df
+			raise FileNotFoundError("No metadata file found. Please provide a metadata parquet file.")
+		return coverage_df, metadata_df
 	except Exception as e:
 		raise RuntimeError(f"Failed to load coverage or metadata: {e}")
 
-def filter_hedge_instruments(subset_filter, coverage_path='hedge_instruments_coverage.parquet', mapping_path=None, save=True, run_dir=None):
+def filter_hedge_instruments(subset_filter, coverage_path='hedge_instruments_coverage.parquet', mapping_path=None, save=True, run_dir=None, price_csv_path=None, price_df=None):
 	"""
 	Filter hedge instruments by product_type and load_type, and save the filtered results.
 	Steps:
@@ -68,26 +51,26 @@ def filter_hedge_instruments(subset_filter, coverage_path='hedge_instruments_cov
 	  5. Calculates and updates the price column in the filtered metadata using forward price calculation for the subset.
 
 	Args:
-		product_type (str or list): The product type to filter (e.g., 'month', 'year').
-		load_type (str or list): The load type to filter (e.g., 'base', 'peak').
+		subset_filter (dict or list[dict]):
+			Either a single dict like {"product_type": "month", "load_type": "base"}
+			or a list of such dicts for multiple selections.
 		coverage_path (str): Path to the coverage matrix file (Parquet or Excel).
 		mapping_path (str): Path to the metadata file (Parquet or Excel).
 		save (bool): Whether to save the filtered results to disk.
 		run_dir (str or None): Directory to save the run output (auto-generated if None).
+		price_csv_path (str or None): Optional explicit price CSV path. If None, auto-detect from Data/current by substring 'pri'.
+		price_df (pd.DataFrame or None): Optional preloaded price data with DatetimeIndex.
 
 	Returns:
 		filtered_coverage (pd.DataFrame or None): The filtered coverage matrix, or None if no instruments found.
 	"""
-	"""
-	Filter hedge instruments by product_type and load_type.
-	- Loads coverage and metadata.
-	- Filters metadata for the given 	pytest tests/test_calculate_forward_prices_as_mean_from_pfc.pyproduct_type and load_type.
-	- Selects columns in coverage corresponding to the filtered instruments (plus 'datetime' if present).
-	- Optionally saves filtered coverage and metadata to Parquet and Excel in a run directory.
-	Returns: filtered coverage DataFrame, or None if no instruments found.
-	"""
 	try:
-		coverage_df, metadata_df = load_coverage_and_metadata(coverage_path, mapping_path)
+		# Load metadata first so parquet coverage can be read with column projection.
+		# This avoids materializing the full wide coverage matrix when only a subset is needed.
+		if mapping_path and os.path.exists(mapping_path):
+			metadata_df = pd.read_parquet(mapping_path)
+		else:
+			raise FileNotFoundError("No metadata file found. Please provide a metadata parquet file.")
 		# Support both a list of dicts (precise selection) or a dict (legacy)
 		if isinstance(subset_filter, list):
 			mask = pd.Series([False] * len(metadata_df))
@@ -114,8 +97,9 @@ def filter_hedge_instruments(subset_filter, coverage_path='hedge_instruments_cov
 		if not selected_ids:
 			print(f"No instruments found for subset_filter={subset_filter}.")
 			return None, None
-		cols = ['datetime'] + selected_ids if 'datetime' in coverage_df.columns else selected_ids
-		filtered_coverage = coverage_df[cols]
+		# Read only the required columns from parquet.
+		parquet_cols = ['datetime'] + selected_ids
+		filtered_coverage = pd.read_parquet(coverage_path, columns=parquet_cols)
 		print(f"Filtered coverage matrix shape: {filtered_coverage.shape}")
 		actual_run_dir = None
 		if save:
@@ -133,20 +117,37 @@ def filter_hedge_instruments(subset_filter, coverage_path='hedge_instruments_cov
 			print(f"Filtered metadata saved to {out_metadata_parquet}")
 
 			# --- Integrate forward price calculation for this subset ---
-			price_csv_path = "Data/current/26_pri_de_fut_front-year_clo_€-mwh_cet_h_f_202508010000.csv"
+			resolved_price_csv_path = price_csv_path
+			if price_df is None:
+				resolved_price_csv_path = resolved_price_csv_path or find_latest_csv_with_substring("pri", data_dir="Data/current")
+				print(f"Using price CSV: {resolved_price_csv_path}")
+			else:
+				print("Using preloaded price data for forward price calculation")
 			calculate_forward_prices_for_coverage(
 				coverage_path=out_coverage_parquet,
 				metadata_path=out_metadata_parquet,
-				price_csv_path=price_csv_path,
+				price_csv_path=resolved_price_csv_path,
+				price_df=price_df,
 				output_metadata_path=out_metadata_parquet
 			)
 
-			# Reload the updated metadata (with prices) for Excel export
-			updated_meta = pd.read_parquet(out_metadata_parquet)
-			with pd.ExcelWriter(out_excel, engine='openpyxl') as writer:
-				filtered_coverage.to_excel(writer, sheet_name='coverage', index=True)
-				updated_meta.to_excel(writer, sheet_name='metadata', index=False)
-			print(f"Filtered coverage and metadata saved to {out_excel}")
+			if SAVE_EXCEL:
+				# Reload the updated metadata (with prices) for Excel export
+				updated_meta = pd.read_parquet(out_metadata_parquet)
+				# Remove timezone from filtered_coverage for Excel export (Excel doesn't support timezones)
+				filtered_coverage_for_excel = filtered_coverage.copy()
+				if isinstance(filtered_coverage_for_excel.index, pd.DatetimeIndex) and filtered_coverage_for_excel.index.tz is not None:
+					filtered_coverage_for_excel.index = filtered_coverage_for_excel.index.tz_localize(None)
+				# Also remove timezones from any datetime columns
+				for col in filtered_coverage_for_excel.columns:
+					if isinstance(filtered_coverage_for_excel[col].dtype, pd.DatetimeTZDtype):
+						filtered_coverage_for_excel[col] = filtered_coverage_for_excel[col].dt.tz_localize(None)
+				with pd.ExcelWriter(out_excel, engine='openpyxl') as writer:
+					filtered_coverage_for_excel.to_excel(writer, sheet_name='coverage', index=True)
+					updated_meta.to_excel(writer, sheet_name='metadata', index=False)
+				print(f"Filtered coverage and metadata saved to {out_excel}")
+			else:
+				print("Skipping Excel export (SAVE_EXCEL=False)")
 		return filtered_coverage, actual_run_dir
 	except Exception as e:
 		raise RuntimeError(f"Error in filter_hedge_instruments: {e}")
@@ -157,15 +158,11 @@ def main():
 	- Supports both single and interactive batch filtering modes.
 	- Saves filtered results and updates forward prices for each subset.
 	"""
-	"""
-	Main entry point for command-line usage.
-	Parses arguments and runs filtering in either single or interactive batch mode.
-	"""
 	parser = argparse.ArgumentParser(description="Filter hedge_instruments_coverage.parquet by product_type and load_type.")
 	parser.add_argument('--product_type', help="Product type to filter (e.g., month, week, year)")
 	parser.add_argument('--load_type', help="Load type to filter (e.g., base, peak)")
-	parser.add_argument('--coverage_path', default='hedge_instruments_coverage.parquet', help="Path to coverage parquet or Excel file")
-	parser.add_argument('--mapping_path', default=None, help="Path to metadata parquet file (optional if using Excel with metadata sheet)")
+	parser.add_argument('--coverage_path', default='hedge_instruments_coverage.parquet', help="Path to coverage parquet file")
+	parser.add_argument('--mapping_path', default=None, help="Path to metadata parquet file")
 	parser.add_argument('--run_dir', default=None, help="Directory to save the run output (default: auto-generated in Data/runs/)")
 	parser.add_argument('--batch', action='store_true', help="Run interactively for all combinations of product_type and load_type")
 	args = parser.parse_args()
@@ -193,8 +190,7 @@ def main():
 			for lt in selected_load_types:
 				print(f"\n--- Running for product_type={pt}, load_type={lt} ---")
 				filter_hedge_instruments(
-					product_type=pt,
-					load_type=lt,
+					subset_filter={"product_type": pt, "load_type": lt},
 					coverage_path=args.coverage_path,
 					mapping_path=args.mapping_path,
 					save=True,
@@ -205,8 +201,7 @@ def main():
 		if not args.product_type or not args.load_type:
 			parser.error('Either --batch or both --product_type and --load_type must be specified.')
 		filter_hedge_instruments(
-			product_type=args.product_type,
-			load_type=args.load_type,
+			subset_filter={"product_type": args.product_type, "load_type": args.load_type},
 			coverage_path=args.coverage_path,
 			mapping_path=args.mapping_path,
 			save=True,

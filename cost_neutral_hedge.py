@@ -6,10 +6,12 @@ all parameters settable at the top, and subset filtering using utils.
 
 import numpy as np
 import pandas as pd
+import os
 from pathlib import Path
 from scipy.optimize import minimize, Bounds, LinearConstraint
 # Add Excel writing utility
 from utils.write_excel import write_cost_neutral_hedge_results
+from utils.load_data import apply_time_horizon, ensure_datetime_index, read_csv_time_window, find_latest_csv_with_substring
 
 # --- PARAMETERS & FLAGS (set here) ---
 # Subset filter (set to e.g. {"product_type": "year", "load_type": "base"} or None for all)
@@ -21,10 +23,10 @@ from utils.write_excel import write_cost_neutral_hedge_results
 
 # Use this SUBSET_FILTER to run the optimization for year base and year peak products only
 # SUBSET_FILTER = [
-SUBSET_FILTER = [     
-    {"product_type": "year", "load_type": "base"},
-    {"product_type": "year", "load_type": "peak"},
-]
+# SUBSET_FILTER = [     
+#     {"product_type": "year", "load_type": "base"},
+#     {"product_type": "year", "load_type": "peak"},
+# ]
 
 # Use this SUBSET_FILTER to run the optimization for quarter base and year peak products only
 # SUBSET_FILTER = [
@@ -33,10 +35,10 @@ SUBSET_FILTER = [
 # ]
 
 # Use this SUBSET_FILTER to run the optimization for month base and year peak products only
-# SUBSET_FILTER = [
-#     {"product_type": "month", "load_type": "base"},
-#     {"product_type": "month", "load_type": "peak"},
-# ]
+SUBSET_FILTER = [
+    {"product_type": "month", "load_type": "base"},
+    {"product_type": "month", "load_type": "peak"},
+]
 
 
 
@@ -51,26 +53,59 @@ MIN_HEDGE_RATIO = True    # Constraint V
 # Model parameters
 EPSILON = 0.3            # Tolerance band for constraint III
 HEDGE_RATIO_LB = 0.0     # Lower bound for a^j (IV)
-HEDGE_RATIO_UB = 1    # Upper bound for a^j (IV)
-H_MIN = 0.95               # Minimum hedge ratio (V)
+HEDGE_RATIO_UB = 0.8    # Upper bound for a^j (IV)
+H_MIN = 0.90               # Minimum hedge ratio (V)
+
+# Optional time horizon (inclusive). Dates are filtered from the parquet coverage and CSV inputs.
+# Leave either as None for unbounded range on that side.
+# Example: "2026-01-01", "2026-12-31 23:00:00+01:00" (supports ISO with timezone offset).
+# Warning: Requested dates must exist in all data sources (coverage, loads, prices) or alignment will fail.
+START_DATE = "2028-01-01"
+END_DATE = "2028-12-31 23:00:00+01:00"
 
 # Data paths
 COVERAGE_PATH = "utils/data/hedge_instruments_coverage.parquet"
 METADATA_PATH = "utils/data/hedge_instruments_metadata.parquet"
 
-# Automatically select the current loads and price CSVs from Data/current/
-from pathlib import Path
-current_data_dir = Path("Data/current")
-def find_csv_with_substring(substring):
-    files = list(current_data_dir.glob("*.csv"))
-    for f in files:
-        if substring in f.name:
-            return str(f)
-    raise FileNotFoundError(f"No CSV file with '{substring}' in name found in {current_data_dir}")
+
+def resolve_coverage_path_for_horizon(coverage_path, start_date=None, end_date=None):
+    """
+    Prefer a year-specific parquet when the requested horizon stays within one year.
+
+    Falls back to the provided coverage_path if no matching yearly file exists or the
+    horizon spans multiple years.
+    """
+    if start_date is None and end_date is None:
+        return coverage_path
+
+    try:
+        start_year = pd.Timestamp(start_date).year if start_date is not None else None
+        end_year = pd.Timestamp(end_date).year if end_date is not None else None
+    except Exception:
+        return coverage_path
+
+    if start_year is None:
+        target_year = end_year
+    elif end_year is None:
+        target_year = start_year
+    elif start_year == end_year:
+        target_year = start_year
+    else:
+        return coverage_path
+
+    if target_year is None:
+        return coverage_path
+
+    coverage_file = Path(coverage_path)
+    yearly_candidate = coverage_file.with_name(f"{coverage_file.stem}_{target_year}{coverage_file.suffix}")
+    if yearly_candidate.exists():
+        print(f"Using year-specific coverage file: {yearly_candidate}")
+        return str(yearly_candidate)
+    return coverage_path
 
 try:
-    LOADS_PATH = find_csv_with_substring("con")  # e.g., consumption/load file
-    PRICE_CSV_PATH = find_csv_with_substring("pri")  # e.g., price file
+    LOADS_PATH = find_latest_csv_with_substring("con", data_dir="Data/current")  # e.g., consumption/load file
+    PRICE_CSV_PATH = find_latest_csv_with_substring("pri", data_dir="Data/current")  # e.g., price file
 except FileNotFoundError as e:
     print(f"[ERROR] {e}\nPlease ensure the correct CSV files are present in Data/current/.")
     raise SystemExit(1)
@@ -113,82 +148,136 @@ def main():
     """
     # --- DATA LOADING & SUBSET FILTERING ---
     from utils.filter_subset_selection_of_hedge_instruments import filter_hedge_instruments
-    from utils.calculate_forward_prices_as_mean_from_pfc import calculate_forward_prices_for_coverage
+
+    resolved_coverage_path = resolve_coverage_path_for_horizon(
+        COVERAGE_PATH,
+        start_date=START_DATE,
+        end_date=END_DATE,
+    )
+
+    # Load price data once and reuse it for both forward-price enrichment and spot series.
+    try:
+        price_df = read_csv_time_window(
+            PRICE_CSV_PATH,
+            start_date=START_DATE,
+            end_date=END_DATE,
+            sep=';',
+            decimal=',',
+        )
+        if price_df.empty:
+            raise ValueError("Price CSV window produced no rows for the requested horizon.")
+        price_value_col = price_df.columns[0]
+        price_df[price_value_col] = pd.to_numeric(
+            price_df[price_value_col].astype(str).str.replace(',', '.'),
+            errors='raise',
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to load spot prices from {PRICE_CSV_PATH}: {e}")
 
     # Filter subset and get coverage/metadata
     try:
         filtered_coverage, run_dir = filter_hedge_instruments(
             subset_filter=SUBSET_FILTER,
-            coverage_path=COVERAGE_PATH,
+            coverage_path=resolved_coverage_path,
             mapping_path=METADATA_PATH,
-            save=SAVE_FILTERED_SUBSET
+            save=SAVE_FILTERED_SUBSET,
+            price_csv_path=PRICE_CSV_PATH,
+            price_df=price_df,
         )
     except Exception as e:
         raise RuntimeError(f"Failed to filter hedge instruments: {e}")
-    try:
-        metadata = pd.read_parquet(METADATA_PATH)
-    except Exception as e:
-        raise RuntimeError(f"Failed to read metadata parquet file {METADATA_PATH}: {e}")
-    # Support SUBSET_FILTER as a list of dicts for precise selection
+    # Load the filtered metadata written by the filter step.
+    # It already contains the subset selection and forward prices, so we avoid
+    # re-reading the full metadata parquet and recomputing prices here.
     if isinstance(SUBSET_FILTER, list):
-        mask = pd.Series([False] * len(metadata))
-        for filt in SUBSET_FILTER:
-            pt = filt["product_type"]
-            lt = filt["load_type"]
-            pt_mask = metadata["product_type"] == pt
-            lt_mask = metadata["load_type"] == lt
-            mask = mask | (pt_mask & lt_mask)
-        subset_ids = metadata[mask]["instrument_id"].tolist()
+        suffix = "_and".join([f"{filt['product_type']}_{filt['load_type']}" for filt in SUBSET_FILTER])
     else:
-        if isinstance(SUBSET_FILTER["product_type"], (list, tuple, set)):
-            product_type_filter = metadata["product_type"].isin(SUBSET_FILTER["product_type"])
-        else:
-            product_type_filter = metadata["product_type"] == SUBSET_FILTER["product_type"]
-        if isinstance(SUBSET_FILTER["load_type"], (list, tuple, set)):
-            load_type_filter = metadata["load_type"].isin(SUBSET_FILTER["load_type"])
-        else:
-            load_type_filter = metadata["load_type"] == SUBSET_FILTER["load_type"]
-        subset_ids = metadata[product_type_filter & load_type_filter]["instrument_id"].tolist()
-
-    # Calculate forward prices for the subset (updates metadata)
+        suffix = f"{SUBSET_FILTER['product_type']}_{SUBSET_FILTER['load_type']}"
+    if run_dir is None:
+        raise RuntimeError("filter_hedge_instruments did not return a run_dir, so filtered metadata cannot be loaded.")
+    filtered_metadata_path = os.path.join(run_dir, f"filtered_metadata_{suffix}.parquet")
     try:
-        calculate_forward_prices_for_coverage(
-            coverage_path=COVERAGE_PATH,
-            metadata_path=METADATA_PATH,
-            price_csv_path=PRICE_CSV_PATH,
-            output_metadata_path=METADATA_PATH
-        )
-        metadata = pd.read_parquet(METADATA_PATH)
+        metadata = pd.read_parquet(filtered_metadata_path)
     except Exception as e:
-        raise RuntimeError(f"Failed to calculate or reload forward prices: {e}")
+        raise RuntimeError(f"Failed to read filtered metadata parquet file {filtered_metadata_path}: {e}")
+    subset_ids = metadata["instrument_id"].tolist()
+    if not subset_ids:
+        raise RuntimeError("No instruments found in filtered metadata. Check your subset filter and filtered output.")
 
     # --- MODEL SETUP ---
     # Extract data arrays
-    coverage = filtered_coverage.set_index("datetime")
+    # Parse coverage datetime to index and apply optional time horizon.
+    # Timezone-aware datetimes are preserved for consistency with input data.
+    coverage = ensure_datetime_index(filtered_coverage, datetime_col="datetime")
+    coverage = apply_time_horizon(coverage, start_date=START_DATE, end_date=END_DATE)
     # Load the load data from LOADS_PATH (required)
     if LOADS_PATH is None:
         raise ValueError("LOADS_PATH must be set to a CSV file containing the true load (L_i) per hour. No fallback is allowed.")
     try:
-        load_df = pd.read_csv(LOADS_PATH, delimiter=';')
-        # Assign to columns by name before setting index (avoids Arrow dtype issues)
-        load_df[load_df.columns[0]] = pd.to_datetime(load_df[load_df.columns[0]], dayfirst=True)
-        load_df[load_df.columns[1]] = pd.to_numeric(load_df[load_df.columns[1]].astype(str).str.replace(',', '.'), errors='raise')
-        load_df = load_df.set_index(load_df.columns[0])
-        loads = load_df.iloc[:, 0].values
+        load_df = read_csv_time_window(
+            LOADS_PATH,
+            start_date=START_DATE,
+            end_date=END_DATE,
+            sep=';',
+            decimal=',',
+        )
+        if load_df.empty:
+            raise ValueError("Load CSV window produced no rows for the requested horizon.")
+        load_value_col = load_df.columns[0]
+        load_df[load_value_col] = pd.to_numeric(
+            load_df[load_value_col].astype(str).str.replace(',', '.'),
+            errors='raise',
+        )
+        # Reindex to coverage timestamps; will fail if any required timestamps are missing.
+        load_series = load_df[load_value_col].reindex(coverage.index)
+        if load_series.isna().any():
+            missing = int(load_series.isna().sum())
+            raise ValueError(f"Load data missing {missing} timestamps after horizon/index alignment.")
+        loads = load_series.astype(float).values
     except Exception as e:
         raise RuntimeError(f"Failed to read or process load data from {LOADS_PATH}: {e}")
-    # Load spot prices from the price CSV (first column = datetime, second column = price)
+    # Reuse already-loaded spot prices and align to coverage timestamps.
     try:
-        price_df = pd.read_csv(PRICE_CSV_PATH, delimiter=';')
-        price_df[price_df.columns[0]] = pd.to_datetime(price_df[price_df.columns[0]], dayfirst=True)
-        price_df[price_df.columns[1]] = pd.to_numeric(price_df[price_df.columns[1]].astype(str).str.replace(',', '.'), errors='raise')
-        price_df = price_df.set_index(price_df.columns[0])
-        spot_prices = price_df.iloc[:, 0].reindex(coverage.index).astype(float).values
+        spot_series = price_df[price_value_col].reindex(coverage.index)
+        if spot_series.isna().any():
+            missing = int(spot_series.isna().sum())
+            raise ValueError(f"Spot price data missing {missing} timestamps after horizon/index alignment.")
+        spot_prices = spot_series.astype(float).values
     except Exception as e:
         raise RuntimeError(f"Failed to load spot prices from {PRICE_CSV_PATH}: {e}")
-    forward_prices = metadata.set_index("instrument_id").loc[subset_ids, "price"].values
-    if forward_prices is None or len(forward_prices) == 0:
+    forward_series = metadata.set_index("instrument_id").loc[subset_ids, "price"].astype(float)
+    if forward_series is None or len(forward_series) == 0:
         raise RuntimeError("forward_prices is None or empty. Check your subset filter and metadata for matching instruments.")
+
+    # Drop instruments without finite forward prices to avoid NaN objective values.
+    valid_mask = np.isfinite(forward_series.values)
+    if not valid_mask.all():
+        invalid_ids = list(np.array(subset_ids)[~valid_mask])
+        print(f"Warning: Dropping {len(invalid_ids)} instruments with invalid forward prices (NaN/inf).")
+        print("Invalid instrument IDs:", invalid_ids)
+
+        diagnostics_path = os.path.join(
+            run_dir,
+            f"filtered_metadata_{suffix}_forward_price_diagnostics.csv",
+        )
+        if os.path.exists(diagnostics_path):
+            try:
+                diagnostics_df = pd.read_csv(diagnostics_path)
+                invalid_diag = diagnostics_df[diagnostics_df["instrument_id"].isin(invalid_ids)]
+                if not invalid_diag.empty:
+                    reason_counts = invalid_diag["reason"].value_counts(dropna=False)
+                    print("Invalid forward-price reason breakdown:")
+                    for reason, count in reason_counts.items():
+                        print(f"  - {reason}: {int(count)}")
+            except Exception as e:
+                print(f"Warning: Could not read diagnostics file {diagnostics_path}: {e}")
+
+        subset_ids = list(np.array(subset_ids)[valid_mask])
+        forward_series = forward_series.iloc[valid_mask]
+        if not subset_ids:
+            raise RuntimeError("All selected instruments have invalid forward prices; cannot optimize.")
+
+    forward_prices = forward_series.values
     instrument_coverage = coverage[subset_ids].values  # shape: (n_hours, n_instruments)
 
     n_hours, n_instruments = instrument_coverage.shape
@@ -216,7 +305,12 @@ def main():
         sum_h_Ihj_Lh = np.sum(instrument_coverage * loads[:, None], axis=0)  # shape: (n_instruments,)
         count_Ihj = np.sum(instrument_coverage, axis=0)  # shape: (n_instruments,)
         # Avoid division by zero
-        avg_load_per_j = np.where(count_Ihj > 0, sum_h_Ihj_Lh / count_Ihj, 0.0)
+        avg_load_per_j = np.divide(
+            sum_h_Ihj_Lh,
+            count_Ihj,
+            out=np.zeros_like(sum_h_Ihj_Lh, dtype=float),
+            where=count_Ihj > 0,
+        )
         # For each hour i, compute sum_j I_{i,j} a^j * avg_load_per_j[j]
         hedge_profile = np.zeros(n_hours)
         for j in range(n_instruments):
@@ -228,7 +322,12 @@ def main():
         n_hours, n_instruments = instrument_coverage.shape
         sum_h_Ihj_Lh = np.sum(instrument_coverage * loads[:, None], axis=0)
         count_Ihj = np.sum(instrument_coverage, axis=0)
-        avg_load_per_j = np.where(count_Ihj > 0, sum_h_Ihj_Lh / count_Ihj, 0.0)
+        avg_load_per_j = np.divide(
+            sum_h_Ihj_Lh,
+            count_Ihj,
+            out=np.zeros_like(sum_h_Ihj_Lh, dtype=float),
+            where=count_Ihj > 0,
+        )
         profile = np.zeros(n_hours)
         for j in range(n_instruments):
             profile += instrument_coverage[:, j] * a[j] * avg_load_per_j[j]
@@ -243,7 +342,12 @@ def main():
             # For each instrument j, compute the average load over all hours it covers
             sum_h_Ihj_Lh = np.sum(instrument_coverage * loads[:, None], axis=0)  # (n_instruments,)
             count_Ihj = np.sum(instrument_coverage, axis=0)  # (n_instruments,)
-            avg_load_per_j = np.where(count_Ihj > 0, sum_h_Ihj_Lh / count_Ihj, 0.0)
+            avg_load_per_j = np.divide(
+                sum_h_Ihj_Lh,
+                count_Ihj,
+                out=np.zeros_like(sum_h_Ihj_Lh, dtype=float),
+                where=count_Ihj > 0,
+            )
             # For each hour i, sum over all j: I_{i,j} * a^j * avg_load_per_j[j]
             profile = np.zeros(n_hours)
             for j in range(n_instruments):

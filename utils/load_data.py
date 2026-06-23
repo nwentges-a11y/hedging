@@ -6,14 +6,183 @@ Includes utility functions for reading CSVs with encoding fallback and exporting
 from __future__ import annotations  # For forward type references (Python 3.7+ compatibility)
 from pathlib import Path            # Pathlib for filesystem path operations
 import pandas as pd                # Pandas for data manipulation
+from pandas.api.types import is_datetime64_any_dtype
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]  # Project root
 DEFAULT_CURRENT_DATA_DIR = PROJECT_ROOT / "Data" / "current"  # Default data dir
+# Business-local timezone used when user passes naive start/end boundaries.
+DEFAULT_BOUNDARY_TIMEZONE = "Europe/Berlin"
 
 
 # Module-level cache for loaded data
 _data_cache = None
+
+
+# --- Datetime Parsing and Horizon Filtering Utilities ---
+# These functions provide flexible, timezone-aware datetime handling to support
+# multiple input formats (ISO, dayfirst, timezone-aware) and optional time-window filtering.
+# Use these helpers in all data ingestion paths to ensure consistent parsing across the pipeline.
+
+def parse_datetime_series(series: pd.Series) -> pd.Series:
+    """Parse a datetime series while supporting both ISO and day-first input formats.
+    
+    For each row, tries ISO format first, then dayfirst if ISO fails.
+    Preserves timezone information if present in input.
+    Raises ValueError if any rows fail to parse with both formats.
+    """
+    text_values = series.astype(str).str.strip()
+    # Try ISO format first, then dayfirst per row to handle mixed-format input.
+    # Build result as a list to avoid pandas tz-aware/tz-naive Series assignment errors.
+    # Use utc=True to handle mixed timezones by converting everything to UTC.
+    parsed_iso = pd.to_datetime(text_values, errors="coerce", utc=True)
+    parsed_dayfirst = pd.to_datetime(text_values, errors="coerce", dayfirst=True, utc=True)
+    result = [
+        iso if not pd.isna(iso) else df
+        for iso, df in zip(parsed_iso, parsed_dayfirst)
+    ]
+    parsed = pd.Series(result, index=series.index, dtype="object")
+    parsed = pd.to_datetime(parsed, errors="coerce", utc=True)
+
+    invalid_count = int(parsed.isna().sum())
+    if invalid_count > 0:
+        raise ValueError(f"Datetime parsing failed for {invalid_count} rows.")
+    return parsed
+
+
+def detect_datetime_column(df: pd.DataFrame) -> str:
+    """Detect a likely datetime column name, falling back to the first column."""
+    preferred_names = {"datetime", "timestamp", "date", "time"}
+    for col in df.columns:
+        if str(col).strip().lower() in preferred_names:
+            return col
+    return df.columns[0]
+
+
+def ensure_datetime_index(df: pd.DataFrame, datetime_col: str | None = None) -> pd.DataFrame:
+    """Return a copy of df with a parsed DatetimeIndex.
+
+    If datetime_col is None, a likely datetime column is detected automatically.
+    """
+    out = df.copy()
+    if datetime_col is None:
+        if isinstance(out.index, pd.DatetimeIndex):
+            return out
+        datetime_col = detect_datetime_column(out)
+
+    out[datetime_col] = parse_datetime_series(out[datetime_col])
+    out = out.set_index(datetime_col)
+    return out
+
+
+def _coerce_boundary_for_index(boundary: str | pd.Timestamp | None, index: pd.DatetimeIndex) -> pd.Timestamp | None:
+    """Coerce start/end boundary to be comparable with a DatetimeIndex."""
+    if boundary is None:
+        return None
+
+    ts = pd.Timestamp(boundary)
+    index_tz = index.tz
+
+    if index_tz is not None:
+        if ts.tzinfo is None:
+            # Interpret naive boundaries as business-local (Europe/Berlin), then align to index tz.
+            ts = ts.tz_localize(DEFAULT_BOUNDARY_TIMEZONE).tz_convert(index_tz)
+        else:
+            ts = ts.tz_convert(index_tz)
+    elif ts.tzinfo is not None:
+        ts = ts.tz_localize(None)
+
+    return ts
+
+
+def apply_time_horizon(
+    df: pd.DataFrame,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Filter a DataFrame with DatetimeIndex to an optional [start_date, end_date] horizon.
+    
+    Both boundaries are INCLUSIVE. Timezone mismatches between boundaries and index
+    are automatically handled by coercing boundaries to match the index timezone.
+    If start_date or end_date is None, that side of the range is unbounded.
+    """
+    if start_date is None and end_date is None:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("apply_time_horizon expects a DataFrame with DatetimeIndex.")
+
+    start_ts = _coerce_boundary_for_index(start_date, df.index)
+    end_ts = _coerce_boundary_for_index(end_date, df.index)
+
+    mask = pd.Series(True, index=df.index)
+    if start_ts is not None:
+        mask &= df.index >= start_ts
+    if end_ts is not None:
+        mask &= df.index <= end_ts
+    return df.loc[mask]
+
+
+def read_csv_time_window(
+    file_path: str | Path,
+    start_date: str | pd.Timestamp | None = None,
+    end_date: str | pd.Timestamp | None = None,
+    sep: str = ";",
+    decimal: str = ",",
+    chunksize: int = 250_000,
+) -> pd.DataFrame:
+    """Read only the needed datetime slice from a CSV using chunked scanning.
+
+    Returns a DataFrame indexed by parsed datetime (timezone-aware, UTC-normalized)
+    filtered to the inclusive [start_date, end_date] window when provided.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    filtered_chunks: list[pd.DataFrame] = []
+    first_columns: list[str] | None = None
+    datetime_col_name: str | None = None
+
+    for chunk in pd.read_csv(path, sep=sep, decimal=decimal, chunksize=chunksize):
+        if first_columns is None:
+            first_columns = [str(c) for c in chunk.columns]
+        datetime_col = detect_datetime_column(chunk)
+        if datetime_col_name is None:
+            datetime_col_name = str(datetime_col)
+
+        chunk[datetime_col] = parse_datetime_series(chunk[datetime_col])
+        chunk = chunk.set_index(datetime_col)
+        chunk = apply_time_horizon(chunk, start_date=start_date, end_date=end_date)
+        if not chunk.empty:
+            filtered_chunks.append(chunk)
+
+    if filtered_chunks:
+        return pd.concat(filtered_chunks, axis=0).sort_index()
+
+    non_dt_cols: list[str] = []
+    if first_columns is not None:
+        non_dt_cols = [c for c in first_columns if c != datetime_col_name]
+    empty = pd.DataFrame(columns=non_dt_cols)
+    empty.index = pd.DatetimeIndex([], name=datetime_col_name, tz="UTC")
+    return empty
+
+
+def find_latest_csv_with_substring(
+    substring: str,
+    data_dir: str | Path | None = None,
+) -> str:
+    """Return newest CSV path in data_dir whose filename contains substring.
+
+    Matching is case-insensitive. Raises FileNotFoundError when no match exists.
+    """
+    base_dir = Path(data_dir) if data_dir is not None else DEFAULT_CURRENT_DATA_DIR
+    files = sorted(base_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    matches = [f for f in files if substring.lower() in f.name.lower()]
+    if not matches:
+        raise FileNotFoundError(f"No CSV file with '{substring}' in name found in {base_dir}")
+    if len(matches) > 1:
+        print(f"Multiple CSV files matched '{substring}'. Using newest: {matches[0].name}")
+    return str(matches[0])
 
 # Load and cache the current data as a dictionary of DataFrames
 def load_my_data():

@@ -1,20 +1,23 @@
 # =============================================================================
-# build_hedge_instrument_matrix_model_input.py
+# build_template_set_of_covered_hours_per_hedge_instrument.py
 #
-# This script generates a matrix of hedge instruments (day, week, month, etc.)
-# and their coverage over a specified time horizon. It outputs both a Parquet
-# file and a multi-sheet Excel file:
-#   - The first sheet contains the hour-by-instrument coverage matrix, with instrument_id as column headers.
-#   - The second sheet contains a mapping table with instrument_id, name, and all instrument metadata.
-# This structure supports robust downstream analysis and easy reference for both machines and humans.
-# The script is designed for use in energy trading and risk management applications, supporting both base and peak load products.
+# Generates a coverage matrix for hedge instruments and their availability over a time horizon.
+# Supports product types: day, week, month, quarter, year (with base and peak load variants).
+#
+# Outputs (to utils/data/):
+#   - hedge_instruments_coverage.parquet: Hour-by-instrument coverage matrix (1=covered, 0=not covered)
+#   - hedge_instruments_metadata.parquet: Instrument metadata (product_type, load_type, dates, etc.)
+#   - hedge_instruments_coverage_and_metadata.xlsx: Excel workbook with coverage and metadata sheets
+#
+# Peak hours: Mon-Fri, 08:00-19:59 CET (instrument.load_type='peak')
+# Base hours: All hours (instrument.load_type='base')
 # =============================================================================
 
 # --- Time horizon configuration (set your desired period here) ---
 # Set the start and end of the time horizon for which to generate the instrument matrix
 # All times are in Europe/Berlin timezone (CET/CEST, local time)
 TIME_HORIZON_START = "2026-01-01 00:00"
-TIME_HORIZON_END = "2026-12-31 23:59"
+TIME_HORIZON_END = "2031-12-31 23:59"
 
 # --- Required imports ---
 import numpy as np  # For numerical operations and matrix handling
@@ -27,35 +30,35 @@ import openpyxl
 # Define the start and end hour for 'peak' load products (CET time)
 PEAK_HOUR_START_CET = 8
 PEAK_HOUR_END_CET = 20
+# Skip Excel export for very large matrices to avoid out-of-memory failures.
+MAX_EXCEL_CELLS = 5_000_000
 
 
-# Generate a list of hedge instruments (day, week, month, etc.) for the given time horizon
 def generate_instrument_list(hour_index: pd.DatetimeIndex) -> list[dict]:
     """
     Generate a complete list of hedge instruments for all product types and periods.
-    """
-    """
-    Generate a complete list of instruments for all product types and periods.
 
     Args:
-        hour_index: Europe/Berlin (CET/CEST) hourly timestamps, length n_hours.
+        hour_index: Europe/Berlin (CET/CEST) hourly timestamps (pd.DatetimeIndex).
 
     Returns:
-        List of instrument dicts, each with keys:
-            - 'product_type': str (day, saturday, sunday, weekend, week, month, quarter, year)
-            - 'load_type': str ('base' or 'peak')
-            - 'start': date object (first calendar day of period, inclusive)
-            - 'end': date object (last calendar day of period, inclusive)
+        List of HedgeInstrument objects, each covering a specific period and load type:
+            - product_type: day, saturday, sunday, weekend, week, month, quarter, year
+            - load_type: 'base' (all hours) or 'peak' (Mon-Fri 08:00-19:59 CET)
+            - start_date, end_date: Calendar date range (inclusive)
     """
     # Use the hourly index (already in Europe/Berlin) to get unique calendar dates
     dates = hour_index.normalize().tz_localize(None).unique().sort_values()
     min_date = dates.min().date()
     max_date = dates.max().date()
 
-    instruments = []  # List to store all generated instruments
+    instruments = []  # List to accumulate all generated HedgeInstrument objects
 
-    # Helper function: add both base and peak variants for a given product type and period as HedgeInstrument objects
     def add_instrument(product_type: str, start: pd.Timestamp, end: pd.Timestamp):
+        """
+        Helper: Create both base and peak load variants of a hedge instrument.
+        Assigns unique human-readable names and appends to instruments list.
+        """
         start_date = start.date() if isinstance(start, pd.Timestamp) else start
         end_date = end.date() if isinstance(end, pd.Timestamp) else end
         for load_type in ["base", "peak"]:
@@ -195,26 +198,26 @@ def generate_instrument_list(hour_index: pd.DatetimeIndex) -> list[dict]:
     return instruments  # List of HedgeInstrument objects
 
 
- # Build a matrix indicating which hours are covered by which instruments
 def build_instrument_coverage(
     hour_index: pd.DatetimeIndex,
     instruments: list,
 ) -> np.ndarray:
     """
-    Build instrument coverage matrix I_{i,j}.
+    Build instrument coverage matrix: which hours are covered by which instruments.
 
     Args:
-        hour_index: Europe/Berlin (CET/CEST) hourly timestamps, length n_hours.
-        instruments: List of HedgeInstrument objects, each with attributes like product_type, load_type, start_date, end_date, etc.
+        hour_index: Europe/Berlin (CET/CEST) hourly timestamps.
+        instruments: List of HedgeInstrument objects.
 
     Returns:
-        coverage: np.ndarray of shape (n_hours, n_instruments), dtype float.
+        coverage: np.ndarray of shape (n_hours, n_instruments), dtype float (0 or 1).
             coverage[i, j] = 1 if hour i is covered by instrument j, else 0.
 
-        Notes:
-                - All hour comparisons are done in Europe/Berlin (CET/CEST, local time).
-                - Weekends never have peak hours per exchange definition, so a peak instrument
-                    whose period falls entirely on weekends will have zero coverage.
+    Notes:
+        - All times are in Europe/Berlin (CET/CEST) local time.
+        - Base instruments: coverage[i,j]=1 for all hours in [start_date, end_date].
+        - Peak instruments: coverage[i,j]=1 only for Mon-Fri, 08:00-19:59 CET.
+        - Peak instruments on weekends will have zero coverage.
     """
     # The hourly index is already in Europe/Berlin (CET/CEST)
     n_hours = len(hour_index)
@@ -240,13 +243,18 @@ def build_instrument_coverage(
     return coverage
 
 
-# New naming convention for instruments
-# Create a readable name for a hedge instrument based on its type and period
 def instrument_name(instr):
     """
-    Generate a human-readable name for a hedge instrument based on its type and period.
+    Generate a human-readable name for a hedge instrument based on product type and period.
+    
+    Examples:
+        - Year: 'Cal26Base', 'Cal26Peak'
+        - Quarter: 'Q1 26Base', 'Q2 26Peak'
+        - Month: 'Jan26Base', 'Feb26Peak'
+        - Week: 'Week01/26Base', 'Week52/26Peak'
+        - Day: 'Mon05/06/26Base', 'Fri31/12/26Peak'
+        - Weekend: 'WKND01/26Base', 'WKND52/26Peak'
     """
-    # Generate a human-readable name for a hedge instrument based on its type and period
     pt = instr['product_type']
     lt = instr['load_type']
     start = instr['start']
@@ -290,38 +298,42 @@ def instrument_name(instr):
         return f"{pt.capitalize()} {lt.capitalize()}"
     
 
-# --- Main block for testing and Excel export ---
+# =============================================================================
+# MAIN: Generate instruments, build coverage matrix, and export results
+# =============================================================================
 if __name__ == "__main__":
-    # Generate a DatetimeIndex for the configured time horizon (hourly, Europe/Berlin local time)
+    # Step 1: Create hourly timezone-aware DatetimeIndex for configured time horizon
     idx = pd.date_range(TIME_HORIZON_START, TIME_HORIZON_END, freq="h", tz="Europe/Berlin")
+    print(f"Time horizon: {TIME_HORIZON_START} to {TIME_HORIZON_END}")
+    print(f"Total hours: {len(idx)}")
 
-    # Generate the list of hedge instruments for the time horizon
+    # Step 2: Generate all hedge instruments (day, week, month, quarter, year x base/peak)
     instruments = generate_instrument_list(idx)
-    print("Number of instruments:", len(instruments))
-    print("First instrument:", instruments[0])
+    print(f"Total instruments: {len(instruments)}")
+    print(f"First instrument: {instruments[0].name} ({instruments[0].product_type}/{instruments[0].load_type})")
 
-    # Build the coverage matrix (hours x instruments)
+    # Step 3: Build coverage matrix (n_hours x n_instruments)
     coverage = build_instrument_coverage(idx, instruments)
-    print("Coverage shape:", coverage.shape)
+    print(f"Coverage matrix shape: {coverage.shape}")
+    print(f"Total coverage cells: {coverage.size}, Non-zero cells: {np.count_nonzero(coverage)}")
 
-    # Export both Parquet and Excel wide-format matrix (datetime as first column, one column per instrument)
+    # Step 4: Prepare output directory
     output_dir = Path("utils/data")
     output_dir.mkdir(exist_ok=True)
-    # The coverage matrix columns are instrument_id for unique, machine-readable reference
+
+    # Step 5: Create coverage DataFrame (columns=instrument_id, rows=hourly timestamps)
     coverage_df = pd.DataFrame(coverage, columns=[instr.instrument_id for instr in instruments])
     coverage_df.insert(0, "datetime", idx)
-
-    # Remove timezone info for both exports
-    for col in coverage_df.select_dtypes(include=["datetimetz"]).columns:
-        coverage_df[col] = coverage_df[col].dt.tz_localize(None)
-
 
     parquet_path = output_dir / "hedge_instruments_coverage.parquet"
     mapping_parquet_path = output_dir / "hedge_instruments_metadata.parquet"
     excel_path = output_dir / "hedge_instruments_coverage_and_metadata.xlsx"
-    coverage_df.to_parquet(parquet_path, index=False)
 
-    # Create mapping DataFrame for instrument metadata (for reference and joining)
+    # Step 6: Save coverage matrix to Parquet (preserves timezone for downstream workflows)
+    coverage_df.to_parquet(parquet_path, index=False)
+    print(f"✓ Coverage matrix saved: {parquet_path}")
+
+    # Step 7: Create and save instrument metadata DataFrame
     mapping_df = pd.DataFrame([
         {
             "instrument_id": instr.instrument_id,
@@ -340,20 +352,30 @@ if __name__ == "__main__":
         }
         for instr in instruments
     ])
-
     mapping_df.to_parquet(mapping_parquet_path, index=False)
+    print(f"✓ Instrument metadata saved: {mapping_parquet_path}")
 
-    # Write both DataFrames to Excel as separate sheets: coverage_matrix and instrument_metadata
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        coverage_df.to_excel(writer, index=False, sheet_name="coverage_matrix")
-        mapping_df.to_excel(writer, index=False, sheet_name="instrument_metadata")
+    # Step 8: Save to Excel (if matrix size is manageable)
+    # Note: Excel has memory limits; skip for very large matrices (e.g., 2020-2035 spanning 6+ years)
+    excel_cells = int(coverage_df.shape[0]) * int(coverage_df.shape[1])
+    if excel_cells <= MAX_EXCEL_CELLS:
+        # Excel doesn't support timezone-aware datetimes, so create timezone-naive copy for export
+        coverage_df_excel = coverage_df.copy()
+        for col in coverage_df_excel.select_dtypes(include=["datetimetz"]).columns:
+            coverage_df_excel[col] = coverage_df_excel[col].dt.tz_localize(None)
 
-    print(f"Exported wide-format matrix to: {parquet_path}")
-    print(f"Exported instrument metadata to: {mapping_parquet_path}")
-    print(f"Exported wide-format matrix and mapping to: {excel_path}")
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            coverage_df_excel.to_excel(writer, index=False, sheet_name="coverage_matrix")
+            mapping_df.to_excel(writer, index=False, sheet_name="instrument_metadata")
+        print(f"✓ Excel workbook saved: {excel_path}")
+    else:
+        print(
+            f"⚠ Skipping Excel export: matrix too large ({excel_cells:,} cells > {MAX_EXCEL_CELLS:,} limit)"
+        )
 
-    # --- Automatically run only the hedge matrix test after building the matrix ---
-    import subprocess
+    print("\n✓ Build complete. Outputs in: utils/data/")
+    
+    # Run pytest on the hedge matrix tests
     print("\nRunning hedge instrument matrix tests (pytest)...")
     result = subprocess.run(["pytest", "tests/test_hedge_matrix.py"], capture_output=True, text=True)
     print(result.stdout)
