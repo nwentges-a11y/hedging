@@ -11,6 +11,13 @@ import pandas as pd
 import cost_neutral_hedge
 from utils.write_excel import write_cost_neutral_hedge_results
 
+
+def _set_objective_coeff(module):
+    cov = np.asarray(module.instrument_coverage, dtype=float)
+    loads = np.asarray(module.loads, dtype=float)
+    fwd = np.asarray(module.forward_prices, dtype=float)
+    module.objective_coeff = fwd * (cov.T @ loads)
+
 def test_cost_neutral_hedge_runs(monkeypatch):
     """
     Basic test: Runs the main optimization workflow with monkeypatched data and checks for success.
@@ -27,6 +34,7 @@ def test_cost_neutral_hedge_runs(monkeypatch):
     cnh.n_instruments = n_instruments
     cnh.constraints = []
     cnh.bounds = None
+    _set_objective_coeff(cnh)
 
     # Simple cost-neutrality constraint for test
     def dummy_constraint(a):
@@ -65,6 +73,7 @@ def test_cost_neutral_hedge_basic_run(monkeypatch, tmp_path):
     monkeypatch.setattr(cost_neutral_hedge, "bounds", None)
     cost_neutral_hedge.subset_ids = [f"inst_{i}" for i in range(n)]
     cost_neutral_hedge.coverage = pd.DataFrame(np.ones((24, n)))
+    _set_objective_coeff(cost_neutral_hedge)
 
     # Run optimization
     result = cost_neutral_hedge.minimize(
@@ -113,6 +122,7 @@ def test_cost_neutrality_constraint_satisfied(monkeypatch, tmp_path):
     monkeypatch.setattr(cost_neutral_hedge, "forward_prices", forward_prices)
     monkeypatch.setattr(cost_neutral_hedge, "constraints", [])
     monkeypatch.setattr(cost_neutral_hedge, "bounds", None)
+    _set_objective_coeff(cost_neutral_hedge)
     # Define local cost_neutrality function for this test
     def cost_neutrality(a):
         hedge_profile = instrument_coverage @ a

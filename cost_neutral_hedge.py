@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import os
 from pathlib import Path
-from scipy.optimize import minimize, Bounds, LinearConstraint
+from scipy.optimize import minimize, Bounds, linprog
 # Add Excel writing utility
 from utils.write_excel import write_cost_neutral_hedge_results
 from utils.load_data import apply_time_horizon, ensure_datetime_index, read_csv_time_window, find_latest_csv_with_substring
@@ -41,7 +41,6 @@ SUBSET_FILTER = [
 ]
 
 
-
 # Flag to save the filtered subset coverage and metadata for reference/debugging
 SAVE_FILTERED_SUBSET = True
 
@@ -62,6 +61,20 @@ H_MIN = 0.90               # Minimum hedge ratio (V)
 # Warning: Requested dates must exist in all data sources (coverage, loads, prices) or alignment will fail.
 START_DATE = "2028-01-01"
 END_DATE = "2028-12-31 23:00:00+01:00"
+
+# Solve strategy
+# - "global": one full-horizon solve
+# - "monthly": rolling monthly chunks with overlap, then optional global polish
+SOLVE_MODE = "monthly" 
+#SOLVE_MODE = "global"
+CHUNK_OVERLAP_HOURS = 48
+POLISH_GLOBAL_AFTER_CHUNKS = True
+
+# Optimizer backend
+# - "linprog": deterministic LP solve via HiGHS (recommended for this linear model)
+# - "slsqp": nonlinear optimizer path (legacy)
+#OPTIMIZER_BACKEND = "linprog"
+OPTIMIZER_BACKEND = "slsqp"
 
 # Data paths
 COVERAGE_PATH = "utils/data/hedge_instruments_coverage.parquet"
@@ -117,6 +130,7 @@ loads = None
 spot_prices = None
 instrument_coverage = None
 forward_prices = None
+objective_coeff = None
 constraints = []
 bounds = None
 
@@ -127,15 +141,223 @@ def objective(a):
     a: array of hedge ratios (length n_instruments)
     Implements: sum_j sum_i P^j * a^j * indicator(i in I^j) * L_i
     """
-    # instrument_coverage: shape (n_hours, n_instruments), loads: shape (n_hours,)
-    # forward_prices: shape (n_instruments,)
-    total_cost = 0.0
-    for j in range(len(forward_prices)):
-        total_cost += np.sum(forward_prices[j] * a[j] * instrument_coverage[:, j] * loads)
-    return total_cost
+    # objective_coeff already contains P^j * sum_i(I_{i,j} * L_i)
+    if objective_coeff is None:
+        raise RuntimeError("objective_coeff is not initialized.")
+    return float(np.dot(objective_coeff, a))
+
+
+def build_problem_matrices(cov, loads_vec, spot_vec, fwd_vec):
+    """
+    Build vectorized matrices/vectors for objective and constraints.
+    """
+    covered_load_per_instr = cov.T @ loads_vec
+    covered_hours_per_instr = cov.sum(axis=0)
+    avg_load_per_instr = np.divide(
+        covered_load_per_instr,
+        covered_hours_per_instr,
+        out=np.zeros_like(covered_load_per_instr, dtype=float),
+        where=covered_hours_per_instr > 0,
+    )
+    hedge_matrix = cov * avg_load_per_instr[np.newaxis, :]
+    obj_coeff = fwd_vec * covered_load_per_instr
+    cost_neutral_vec = hedge_matrix.T @ spot_vec
+    cost_neutral_rhs = float(loads_vec @ spot_vec)
+    total_load = float(np.sum(loads_vec))
+    min_ratio_vec = np.divide(
+        covered_load_per_instr,
+        total_load,
+        out=np.zeros_like(covered_load_per_instr, dtype=float),
+        where=total_load != 0,
+    )
+    return {
+        "covered_hours_per_instr": covered_hours_per_instr,
+        "covered_load_per_instr": covered_load_per_instr,
+        "avg_load_per_instr": avg_load_per_instr,
+        "hedge_matrix": hedge_matrix,
+        "objective_coeff": obj_coeff,
+        "cost_neutral_vec": cost_neutral_vec,
+        "cost_neutral_rhs": cost_neutral_rhs,
+        "min_ratio_vec": min_ratio_vec,
+    }
+
+
+def make_bounds(covered_hours_per_instr):
+    if not HEDGE_RATIO_BOUNDS:
+        return None
+    lb = np.where(covered_hours_per_instr > 0, HEDGE_RATIO_LB, 0.0)
+    ub = np.where(covered_hours_per_instr > 0, HEDGE_RATIO_UB, 0.0)
+    return Bounds(lb, ub)
+
+
+def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global"):
+    mats = build_problem_matrices(cov, loads_vec, spot_vec, fwd_vec)
+    local_bounds = make_bounds(mats["covered_hours_per_instr"])
+
+    def local_objective(a):
+        return float(np.dot(mats["objective_coeff"], a))
+
+    constraints_local = []
+
+    def cost_neutrality(a):
+        return mats["cost_neutral_rhs"] - float(np.dot(mats["cost_neutral_vec"], a))
+
+    constraints_local.append({"type": "eq", "fun": cost_neutrality})
+
+    hedge_matrix = mats["hedge_matrix"]
+
+    def hedge_profile_latex(a):
+        return hedge_matrix @ a
+
+    if ENFORCE_COVERAGE:
+        def coverage_lower(a):
+            return (hedge_matrix @ a) - (1 - EPSILON) * loads_vec
+
+        def coverage_upper(a):
+            return (1 + EPSILON) * loads_vec - (hedge_matrix @ a)
+
+        constraints_local.append({"type": "ineq", "fun": coverage_lower})
+        constraints_local.append({"type": "ineq", "fun": coverage_upper})
+
+    if MIN_HEDGE_RATIO:
+        def min_hedge_ratio(a):
+            return float(np.dot(mats["min_ratio_vec"], a) - H_MIN)
+
+        constraints_local.append({"type": "ineq", "fun": min_hedge_ratio})
+
+    if a0 is None:
+        a0 = np.full(cov.shape[1], 0.5)
+    if local_bounds is not None:
+        a0 = np.clip(a0, local_bounds.lb, local_bounds.ub)
+
+    print(f"\nConstraint values at initial guess for {label}:")
+    for i, c in enumerate(constraints_local):
+        val = c["fun"](a0)
+        if c["type"] == "eq":
+            print(f"Constraint {i} (equality): value = {val}")
+        else:
+            minval = np.min(val) if hasattr(val, "__len__") else val
+            print(f"Constraint {i} (inequality): min value = {minval}")
+
+    print(f"Starting optimizer for {label} with backend={OPTIMIZER_BACKEND}...")
+    if OPTIMIZER_BACKEND == "linprog":
+        n_vars = cov.shape[1]
+        c = mats["objective_coeff"]
+
+        A_eq = np.atleast_2d(mats["cost_neutral_vec"])
+        b_eq = np.array([mats["cost_neutral_rhs"]], dtype=float)
+
+        A_ub_blocks = []
+        b_ub_blocks = []
+
+        if ENFORCE_COVERAGE:
+            # (hedge_matrix @ a) - (1-eps)loads >= 0  ->  -hedge_matrix @ a <= -(1-eps)loads
+            A_ub_blocks.append(-hedge_matrix)
+            b_ub_blocks.append(-(1 - EPSILON) * loads_vec)
+            # (1+eps)loads - (hedge_matrix @ a) >= 0  ->   hedge_matrix @ a <=  (1+eps)loads
+            A_ub_blocks.append(hedge_matrix)
+            b_ub_blocks.append((1 + EPSILON) * loads_vec)
+
+        if MIN_HEDGE_RATIO:
+            # dot(min_ratio_vec, a) - H_MIN >= 0  ->  -dot(min_ratio_vec, a) <= -H_MIN
+            A_ub_blocks.append(-np.atleast_2d(mats["min_ratio_vec"]))
+            b_ub_blocks.append(np.array([-H_MIN], dtype=float))
+
+        if A_ub_blocks:
+            A_ub = np.vstack(A_ub_blocks)
+            b_ub = np.concatenate([np.ravel(x) for x in b_ub_blocks])
+        else:
+            A_ub = None
+            b_ub = None
+
+        if local_bounds is None:
+            bounds_lp = [(None, None)] * n_vars
+        else:
+            bounds_lp = list(zip(local_bounds.lb.tolist(), local_bounds.ub.tolist()))
+
+        lp_result = linprog(
+            c=c,
+            A_ub=A_ub,
+            b_ub=b_ub,
+            A_eq=A_eq,
+            b_eq=b_eq,
+            bounds=bounds_lp,
+            method="highs",
+        )
+
+        result = lp_result
+    elif OPTIMIZER_BACKEND == "slsqp":
+        result = minimize(
+            local_objective,
+            a0,
+            method="SLSQP",
+            bounds=local_bounds,
+            constraints=constraints_local,
+            options={"disp": True},
+        )
+    else:
+        raise ValueError(f"Unsupported OPTIMIZER_BACKEND='{OPTIMIZER_BACKEND}'. Use 'linprog' or 'slsqp'.")
+
+    return result, mats, constraints_local, local_bounds, hedge_profile_latex
+
+
+def iter_month_chunks(index, overlap_hours):
+    overlap = pd.Timedelta(hours=overlap_hours)
+    tz = index.tz
+    first = index.min()
+    last = index.max()
+    month_start = pd.Timestamp(first.year, first.month, 1, tz=tz)
+    while month_start <= last:
+        next_month = month_start + pd.offsets.MonthBegin(1)
+        core_start = month_start
+        core_end = next_month - pd.Timedelta(hours=1)
+        chunk_start = core_start - overlap
+        chunk_end = core_end + overlap
+        core_mask = (index >= core_start) & (index <= core_end)
+        chunk_mask = (index >= chunk_start) & (index <= chunk_end)
+        yield core_start, core_end, chunk_mask, core_mask
+        month_start = next_month
+
+
+def monthly_chunk_initializer(cov, loads_vec, spot_vec, fwd_vec, hour_index):
+    n_instr = cov.shape[1]
+    accum = np.zeros(n_instr)
+    weights = np.zeros(n_instr)
+    prev_a = np.full(n_instr, 0.5)
+
+    for core_start, core_end, chunk_mask, core_mask in iter_month_chunks(hour_index, CHUNK_OVERLAP_HOURS):
+        if not np.any(core_mask) or not np.any(chunk_mask):
+            continue
+
+        label = f"chunk {core_start.strftime('%Y-%m')}"
+        chunk_cov = cov[chunk_mask]
+        chunk_loads = loads_vec[chunk_mask]
+        chunk_spot = spot_vec[chunk_mask]
+
+        result_chunk, _, _, bounds_chunk, _ = solve_vectorized(
+            chunk_cov,
+            chunk_loads,
+            chunk_spot,
+            fwd_vec,
+            a0=prev_a,
+            label=label,
+        )
+
+        if result_chunk.success:
+            prev_a = result_chunk.x
+        elif bounds_chunk is not None:
+            prev_a = np.clip(prev_a, bounds_chunk.lb, bounds_chunk.ub)
+
+        core_cov = cov[core_mask]
+        core_weights = core_cov.sum(axis=0)
+        accum += prev_a * core_weights
+        weights += core_weights
+
+    init_a = np.divide(accum, weights, out=prev_a.copy(), where=weights > 0)
+    return init_a
 
 def main():
-    global forward_prices, instrument_coverage, loads
+    global forward_prices, instrument_coverage, loads, spot_prices, constraints, bounds, objective_coeff, n_instruments
     """
     Main workflow for cost-neutral hedge optimization.
 
@@ -277,112 +499,18 @@ def main():
         if not subset_ids:
             raise RuntimeError("All selected instruments have invalid forward prices; cannot optimize.")
 
-    forward_prices = forward_series.values
-    instrument_coverage = coverage[subset_ids].values  # shape: (n_hours, n_instruments)
+    # Keep all filtered instruments (no pruning of low-coverage or duplicate columns).
+    subset_ids = [sid for sid in subset_ids if sid in coverage.columns and sid in forward_series.index]
+    if not subset_ids:
+        raise RuntimeError("No subset instruments remain after alignment with coverage and forward prices.")
 
+    forward_series = forward_series.loc[subset_ids]
+    forward_prices = forward_series.values
+    instrument_coverage = coverage[subset_ids].to_numpy(dtype=float)
     n_hours, n_instruments = instrument_coverage.shape
 
-    # --- CONSTRAINTS ---
-    constraints = []
-
-    # (II) Cost-neutrality constraint
-    # Enforces that the total cost of the hedge matches the cost of the actual load profile,
-    # using the spot price as the reference. This implements the LaTeX model constraint:
-    #   sum_i [L_i - sum_j I_{i,j} a^j (sum_h I_{h,j} L_h / |I^j|)] * P_i^{spot} = 0
-    # where:
-    #   - L_i: actual load in hour i
-    #   - I_{i,j}: indicator if instrument j covers hour i
-    #   - a^j: hedge ratio for instrument j
-    #   - (sum_h I_{h,j} L_h / |I^j|): average load covered by instrument j
-    #   - P_i^{spot}: spot price in hour i
-    # This ensures the hedge is cost-neutral with respect to the spot market.
-    def cost_neutrality(a):
-        # Implements: sum_i (L_i - sum_j I_{i,j} a^j (sum_h I_{h,j} L_h / |I^j|)) * P_i^{spot} = 0
-        if spot_prices is None:
-            return 0.0
-        n_hours, n_instruments = instrument_coverage.shape
-        # Precompute sum_h I_{h,j} L_h and |I^j| for each instrument j
-        sum_h_Ihj_Lh = np.sum(instrument_coverage * loads[:, None], axis=0)  # shape: (n_instruments,)
-        count_Ihj = np.sum(instrument_coverage, axis=0)  # shape: (n_instruments,)
-        # Avoid division by zero
-        avg_load_per_j = np.divide(
-            sum_h_Ihj_Lh,
-            count_Ihj,
-            out=np.zeros_like(sum_h_Ihj_Lh, dtype=float),
-            where=count_Ihj > 0,
-        )
-        # For each hour i, compute sum_j I_{i,j} a^j * avg_load_per_j[j]
-        hedge_profile = np.zeros(n_hours)
-        for j in range(n_instruments):
-            hedge_profile += instrument_coverage[:, j] * a[j] * avg_load_per_j[j]
-        return np.sum((loads - hedge_profile) * spot_prices)
-    constraints.append({'type': 'eq', 'fun': cost_neutrality})
-
-    def hedge_profile_latex(a):
-        n_hours, n_instruments = instrument_coverage.shape
-        sum_h_Ihj_Lh = np.sum(instrument_coverage * loads[:, None], axis=0)
-        count_Ihj = np.sum(instrument_coverage, axis=0)
-        avg_load_per_j = np.divide(
-            sum_h_Ihj_Lh,
-            count_Ihj,
-            out=np.zeros_like(sum_h_Ihj_Lh, dtype=float),
-            where=count_Ihj > 0,
-        )
-        profile = np.zeros(n_hours)
-        for j in range(n_instruments):
-            profile += instrument_coverage[:, j] * a[j] * avg_load_per_j[j]
-        return profile
-
-    # (III) Coverage/shape constraint (LaTeX model, optional)
-    if ENFORCE_COVERAGE:
-        # Implements: (1-epsilon_i)L_i <= sum_j I_{i,j} a^j (sum_h I_{h,j} L_h / |I^j|) <= (1+epsilon_i)L_i
-        # This matches the LaTeX model for the coverage/shape constraint.
-        def hedge_profile_latex(a):
-            n_hours, n_instruments = instrument_coverage.shape
-            # For each instrument j, compute the average load over all hours it covers
-            sum_h_Ihj_Lh = np.sum(instrument_coverage * loads[:, None], axis=0)  # (n_instruments,)
-            count_Ihj = np.sum(instrument_coverage, axis=0)  # (n_instruments,)
-            avg_load_per_j = np.divide(
-                sum_h_Ihj_Lh,
-                count_Ihj,
-                out=np.zeros_like(sum_h_Ihj_Lh, dtype=float),
-                where=count_Ihj > 0,
-            )
-            # For each hour i, sum over all j: I_{i,j} * a^j * avg_load_per_j[j]
-            profile = np.zeros(n_hours)
-            for j in range(n_instruments):
-                profile += instrument_coverage[:, j] * a[j] * avg_load_per_j[j]
-            return profile
-        def coverage_lower(a):
-            # Lower bound: hedge profile >= (1-epsilon)*load
-            profile = hedge_profile_latex(a)
-            return profile - (1-EPSILON)*loads
-        def coverage_upper(a):
-            # Upper bound: hedge profile <= (1+epsilon)*load
-            profile = hedge_profile_latex(a)
-            return (1+EPSILON)*loads - profile
-        constraints.append({'type': 'ineq', 'fun': coverage_lower})
-        constraints.append({'type': 'ineq', 'fun': coverage_upper})
-
-    # (IV) Hedge ratio bounds (optional)
-    # Apply bounds only to hedge ratios a^j for instruments that actually cover at least one hour (|I^j| > 0).
-    # For unused instruments (|I^j| == 0), set bounds to (0, 0) to fix their value at zero (or use (None, None) for unconstrained).
-    bounds = None
-    if HEDGE_RATIO_BOUNDS:
-        count_Ihj = np.sum(instrument_coverage, axis=0)  # shape: (n_instruments,)
-        lb = np.where(count_Ihj > 0, HEDGE_RATIO_LB, 0.0)  # Only bound active instruments, fix unused at 0
-        ub = np.where(count_Ihj > 0, HEDGE_RATIO_UB, 0.0)
-        bounds = Bounds(lb, ub)
-
-    # (V) Minimum hedge ratio (optional)
-    # Enforces that the total hedged volume (in MWh) is at least H_MIN times the total load volume.
-    # Implements: sum_{i,j} I_{i,j} a^j L_i / sum_i L_i >= H_MIN
-    if MIN_HEDGE_RATIO:
-        def min_hedge_ratio(a):
-            # Compute total hedged MWh: sum over all hours and instruments
-            total_hedged = np.sum(instrument_coverage * a * loads[:, None])
-            return total_hedged / np.sum(loads) - H_MIN
-        constraints.append({'type': 'ineq', 'fun': min_hedge_ratio})
+    if SOLVE_MODE not in {"global", "monthly"}:
+        raise ValueError(f"Invalid SOLVE_MODE='{SOLVE_MODE}'. Use 'global' or 'monthly'.")
 
     # --- SOLVE ---
     # Solve the optimization problem using scipy.optimize.minimize with all defined constraints and bounds.
@@ -390,30 +518,48 @@ def main():
     # If the optimization fails, prints the full result and traceback for debugging.
     if __name__ == "__main__":
         try:
-            # Set the initial guess for hedge ratios (a^j) to 0.5 for all instruments
-            a0 = np.full(n_instruments, 0.5)
-            # Print constraint values at initial guess
-            print("\nConstraint values at initial guess (a0 = 0.5):")
-            for i, c in enumerate(constraints):
-                val = c['fun'](a0)
-                if c['type'] == 'eq':
-                    print(f"Constraint {i} (equality): value = {val}")
-                else:
-                    minval = np.min(val) if hasattr(val, '__len__') else val
-                    print(f"Constraint {i} (inequality): min value = {minval}")
-
             import time
-            print("Starting optimizer...")
             t0 = time.time()
-            # Run the optimization using SLSQP with all constraints and bounds
-            result = minimize(
-                objective,           # Objective function to minimize
-                a0,                  # Initial guess
-                method='SLSQP',      # Sequential Least Squares Programming
-                bounds=bounds,       # Bounds for hedge ratios
-                constraints=constraints,  # List of constraints (dicts)
-                options={'disp': True}    # Display solver output
-            )
+
+            if SOLVE_MODE == "monthly":
+                print("Running monthly chunk initialization...")
+                a_init = monthly_chunk_initializer(
+                    instrument_coverage,
+                    loads,
+                    spot_prices,
+                    forward_prices,
+                    coverage.index,
+                )
+                if POLISH_GLOBAL_AFTER_CHUNKS:
+                    print("Running final global polish solve...")
+                    result, mats, constraints, bounds, hedge_profile_func = solve_vectorized(
+                        instrument_coverage,
+                        loads,
+                        spot_prices,
+                        forward_prices,
+                        a0=a_init,
+                        label="global polish",
+                    )
+                else:
+                    result, mats, constraints, bounds, hedge_profile_func = solve_vectorized(
+                        instrument_coverage,
+                        loads,
+                        spot_prices,
+                        forward_prices,
+                        a0=a_init,
+                        label="monthly-seeded global",
+                    )
+            else:
+                result, mats, constraints, bounds, hedge_profile_func = solve_vectorized(
+                    instrument_coverage,
+                    loads,
+                    spot_prices,
+                    forward_prices,
+                    a0=None,
+                    label="global",
+                )
+
+            objective_coeff = mats["objective_coeff"]
             t1 = time.time()
             print(f"Optimizer finished. Elapsed: {t1-t0:.2f} seconds.")
             # Print the optimal hedge ratios found by the optimizer
@@ -460,7 +606,7 @@ def main():
             # Use coverage index as hour_index if available
             hour_index = coverage.index if hasattr(coverage, "index") else None
             # Compute hedge profile using the local function
-            hedge_profile = hedge_profile_latex(result.x)
+            hedge_profile = hedge_profile_func(result.x)
             output_path = write_cost_neutral_hedge_results(
                 result=result_dict,
                 instrument_names=instrument_names,
