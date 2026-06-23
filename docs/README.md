@@ -50,6 +50,22 @@ Most runtime settings are in `cost_neutral_hedge.py`:
 - `SAVE_FILTERED_SUBSET`: whether to persist filtered coverage/metadata in `Data/runs/`.
 - `ENFORCE_COVERAGE`, `HEDGE_RATIO_BOUNDS`, `MIN_HEDGE_RATIO`: model constraint toggles.
 - `EPSILON`, `HEDGE_RATIO_LB`, `HEDGE_RATIO_UB`, `H_MIN`: model parameters.
+- `OPTIMIZER_BACKEND`: choose `linprog` for the linear-program path or `slsqp` for the legacy callback-based path.
+- `SOLVE_MODE`: use `global` for a single solve or `monthly` for chunked initialization.
+- `CHUNK_OVERLAP_HOURS`: only used in `monthly` mode to give each chunk context around month boundaries.
+
+Product coverage behavior:
+
+- `day` products cover Monday to Friday only.
+- `saturday` and `sunday` products exist as separate product types.
+- `weekend` products cover Saturday + Sunday together.
+- Each product type is generated with both `base` and `peak` load variants.
+
+Solver behavior:
+
+- `linprog` solves the model as a linear program with matrix-form equality and inequality constraints.
+- `slsqp` solves the same model through `scipy.optimize.minimize` with constraint callbacks.
+- The underlying hedge model does not change; only the numerical solver changes.
 
 Coverage file selection behavior:
 

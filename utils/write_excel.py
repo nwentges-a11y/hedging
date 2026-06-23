@@ -54,7 +54,9 @@ def write_cost_neutral_hedge_results(
             for key in [
                 "ENFORCE_COVERAGE", "HEDGE_RATIO_BOUNDS", "MIN_HEDGE_RATIO",
                 "EPSILON", "HEDGE_RATIO_LB", "HEDGE_RATIO_UB", "H_MIN",
-                "SUBSET_FILTER", "SAVE_FILTERED_SUBSET"
+                "SUBSET_FILTER", "SAVE_FILTERED_SUBSET",
+                "SOLVE_MODE", "CHUNK_OVERLAP_HOURS", "POLISH_GLOBAL_AFTER_CHUNKS",
+                "OPTIMIZER_BACKEND",
             ]:
                 if key in frame.f_globals:
                     model_flags[key] = frame.f_globals[key]
