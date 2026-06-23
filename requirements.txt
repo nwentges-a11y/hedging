@@ -1,0 +1,6 @@
+# Project requirements for Hedging
+pandas
+numpy
+scipy
+pytest
+openpyxl
