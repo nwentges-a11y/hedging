@@ -159,8 +159,12 @@ def build_problem_matrices(cov, loads_vec, spot_vec, fwd_vec):
         out=np.zeros_like(covered_load_per_instr, dtype=float),
         where=covered_hours_per_instr > 0,
     )
+    # Flat-block hedge profile per instrument: instrument j contributes the same MW
+    # in every covered hour i, namely avg_load_per_instr[j].
     hedge_matrix = cov * avg_load_per_instr[np.newaxis, :]
     obj_coeff = fwd_vec * covered_load_per_instr
+    # Cost-neutrality uses exact hourly spot prices and aggregates over all hours.
+    # This enforces equality in total EUR, not hour-by-hour equality.
     cost_neutral_vec = hedge_matrix.T @ spot_vec
     cost_neutral_rhs = float(loads_vec @ spot_vec)
     total_load = float(np.sum(loads_vec))
@@ -185,21 +189,25 @@ def build_problem_matrices(cov, loads_vec, spot_vec, fwd_vec):
 def make_bounds(covered_hours_per_instr):
     if not HEDGE_RATIO_BOUNDS:
         return None
+    # Instruments with no covered hours are fixed to 0 (lb=ub=0).
     lb = np.where(covered_hours_per_instr > 0, HEDGE_RATIO_LB, 0.0)
     ub = np.where(covered_hours_per_instr > 0, HEDGE_RATIO_UB, 0.0)
     return Bounds(lb, ub)
 
 
 def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global"):
+    # Build all vectors/matrices once so both backends use identical math inputs.
     mats = build_problem_matrices(cov, loads_vec, spot_vec, fwd_vec)
     local_bounds = make_bounds(mats["covered_hours_per_instr"])
 
     def local_objective(a):
+        # Linear objective: c^T a
         return float(np.dot(mats["objective_coeff"], a))
 
     constraints_local = []
 
     def cost_neutrality(a):
+        # sum_i L_i * spot_i  -  sum_j a_j * sum_i hedge_matrix[i,j] * spot_i  = 0
         return mats["cost_neutral_rhs"] - float(np.dot(mats["cost_neutral_vec"], a))
 
     constraints_local.append({"type": "eq", "fun": cost_neutrality})
@@ -211,9 +219,11 @@ def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global")
 
     if ENFORCE_COVERAGE:
         def coverage_lower(a):
+            # hedge_profile - (1-eps)*load >= 0
             return (hedge_matrix @ a) - (1 - EPSILON) * loads_vec
 
         def coverage_upper(a):
+            # (1+eps)*load - hedge_profile >= 0
             return (1 + EPSILON) * loads_vec - (hedge_matrix @ a)
 
         constraints_local.append({"type": "ineq", "fun": coverage_lower})
@@ -221,13 +231,16 @@ def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global")
 
     if MIN_HEDGE_RATIO:
         def min_hedge_ratio(a):
+            # Weighted total hedge ratio must exceed H_MIN.
             return float(np.dot(mats["min_ratio_vec"], a) - H_MIN)
 
         constraints_local.append({"type": "ineq", "fun": min_hedge_ratio})
 
     if a0 is None:
+        # Neutral default start; monthly mode usually overwrites this with a warm start.
         a0 = np.full(cov.shape[1], 0.5)
     if local_bounds is not None:
+        # Keep initial guess inside bounds to avoid immediate infeasibility.
         a0 = np.clip(a0, local_bounds.lb, local_bounds.ub)
 
     print(f"\nConstraint values at initial guess for {label}:")
@@ -241,6 +254,7 @@ def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global")
 
     print(f"Starting optimizer for {label} with backend={OPTIMIZER_BACKEND}...")
     if OPTIMIZER_BACKEND == "linprog":
+        # Convert constraints into standard LP form for HiGHS.
         n_vars = cov.shape[1]
         c = mats["objective_coeff"]
 
@@ -287,6 +301,7 @@ def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global")
 
         result = lp_result
     elif OPTIMIZER_BACKEND == "slsqp":
+        # Nonlinear API path using function-based constraints (legacy backend).
         result = minimize(
             local_objective,
             a0,
@@ -302,6 +317,7 @@ def solve_vectorized(cov, loads_vec, spot_vec, fwd_vec, a0=None, label="global")
 
 
 def iter_month_chunks(index, overlap_hours):
+    # Yield core month and expanded chunk masks (with overlap) for robust warm starts.
     overlap = pd.Timedelta(hours=overlap_hours)
     tz = index.tz
     first = index.min()
@@ -320,6 +336,7 @@ def iter_month_chunks(index, overlap_hours):
 
 
 def monthly_chunk_initializer(cov, loads_vec, spot_vec, fwd_vec, hour_index):
+    # Build a global initial guess by solving consecutive monthly chunks.
     n_instr = cov.shape[1]
     accum = np.zeros(n_instr)
     weights = np.zeros(n_instr)
@@ -349,6 +366,8 @@ def monthly_chunk_initializer(cov, loads_vec, spot_vec, fwd_vec, hour_index):
             prev_a = np.clip(prev_a, bounds_chunk.lb, bounds_chunk.ub)
 
         core_cov = cov[core_mask]
+        # Coverage-weighted averaging gives more influence to months where an
+        # instrument is actually active.
         core_weights = core_cov.sum(axis=0)
         accum += prev_a * core_weights
         weights += core_weights
